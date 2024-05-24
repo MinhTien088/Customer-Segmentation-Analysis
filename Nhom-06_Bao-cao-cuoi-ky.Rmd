@@ -1,0 +1,1499 @@
+---
+title: "Nhom-06_Bao-cao-cuoi-ky"
+author: "Nhom 06"
+date: "2023-12-12"
+output:   
+  html_document:
+    df_print: paged
+---
+
+# 1. Giới thiệu
+
+**Bối cảnh:**
+
+Thường thì các bộ dữ liệu thương mại điện tử là tài sản riêng và do đó khó tìm thấy trong số các dữ liệu có sẵn công khai. Tuy nhiên, Bộ lưu trữ Học máy của Đại học California, Irvine ([UCI Machine Learning Repository](http://archive.ics.uci.edu/)) đã cung cấp bộ dữ liệu này chứa các giao dịch thực tế từ năm 2010 và 2011. Bộ dữ liệu được duy trì trên trang web của họ, nơi có thể tìm thấy bộ dữ liệu bằng tiêu đề "[Online Retail](http://archive.ics.uci.edu/dataset/352/online+retail)". Theo UCI Machine Learning Repository, dữ liệu này đã được cung cấp bởi Tiến sĩ Daqing Chen, Giám đốc nhóm Phân tích Công cộng.
+
+**Nội dung:**
+
+Đây là một bộ dữ liệu quốc tế chứa tất cả các giao dịch diễn ra từ 01/12/2010 đến 09/12/2011 cho một doanh nghiệp bán lẻ trực tuyến không có cửa hàng ở tại Vương Quốc Anh và được đăng ký. Công ty chủ yếu bán các sản phẩm quà tặng độc đáo phù hợp cho mọi dịp. Nhiều khách hàng của công ty là các nhà buôn, bán sỉ.
+
+# 2. Chuẩn bị dữ liệu
+
+**Chuẩn bị các thư viện cần thiết**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(plotly)
+library(ggplot2)
+library(tokenizers)
+library(udpipe)
+library(SnowballC)
+library(cluster)
+library(wordcloud2)
+library(lubridate)
+library(fmsb)
+library(prophet)
+library(caret)
+library(readr)
+library(rpart)
+library(randomForest)
+
+set.seed(21133)
+# ^--- Thêm các thư viện mới vào đây
+```
+
+Đọc file .csv
+
+```{r}
+df_raw <- read.csv('data.csv', encoding = "ISO-8859-1", stringsAsFactors = FALSE)
+head(df_raw, 5)
+```
+
+```{r}
+df_initial <- df_raw
+df_initial[order(df_initial$CustomerID), ]
+```
+
+*Vì hàm is.na() có sẵn không thể đếm được các giá trị \<chr\> rỗng "" nên nhóm đã thiết kế một function để đến các giá trị null, NaN cũng như các giá trị ""*
+
+```{r}
+isNA_new <- function(value) {
+  result <- ifelse(is.na(value) | is.null(value), TRUE,
+            ifelse(value == "", TRUE,
+            FALSE))
+  return(result)
+}
+```
+
+Mô tả cơ bản về dữ liệu: kiểu dữ liệu của các cột, số lượng giá trị null và tỉ lệ phần trăm so với số lượng giá trị của các cột
+
+```{r}
+cat("Dataframe dimensions:", dim(df_initial), "\n")
+
+column_info <- function(df) {
+  tab_info <- data.frame(
+    column_type = sapply(df, class),
+    null_values_nb = colSums(isNA_new(df)),
+    null_values_percent = colMeans(isNA_new(df)) * 100
+  )
+  return(tab_info)
+}
+
+tab_info <- column_info(df_initial)
+print(tab_info)
+```
+
+Vì có khoảng 25% record không được chỉ định cho một khách hàng cụ thể. Với dữ liệu có sẵn, không thể áp đặt các giá trị cho người dùng và do đó, các record này không có ý nghĩa đối với phân tích hiện tại. Vì vậy, nhóm quyết định xóa chúng khỏi dataframe
+
+```{r}
+df_initial <- na.omit(df_initial, cols = "CustomerID")
+
+cat("Dataframe dimensions:", dim(df_initial), "\n")
+tab_info <- column_info(df_initial)
+print(tab_info)
+```
+
+Sau khi xử lý các dòng dữ liệu null, ta kiểm tra các dòng dữ liệu trùng nhau và xử lý chúng bằng cách loại bỏ
+
+```{r}
+cat("Duplicate entries: ", sum(duplicated(df_initial)), "\n")
+# Loại mấy dòng trùng
+df_initial <- df_initial[!duplicated(df_initial), ]
+```
+
+Cuối cùng, ta chuyển đổi các kiểu dữ liệu của từng cột sao cho hợp lý Chuyển kiểu dữ liệu của cột InvoiceDate thành dạng thời gian <date>, chuyển kiểu dữ liệu của cột CustomerID thành dạng <chr>
+
+```{r}
+df_initial$InvoiceDate <- as.POSIXct(df_initial$InvoiceDate, format = "%m/%d/%Y %H:%M")
+df_initial$CustomerID <- as.character(df_initial$CustomerID)
+```
+
+Sau khi quá trình chuẩn bị dữ liệu hoàn tất, ta có một tập dữ liệu tương đối hoàn chỉnh
+
+```{r}
+print(dim(df_initial))
+df_initial
+```
+
+# 3. Khai phá dữ liệu
+
+Khung dữ liệu này chứa 8 biến tương ứng với:
+
+-   InvoiceNo: Số hóa đơn - một chuỗi có mô tả như sau: số nguyên gồm 6 chữ số được gán duy nhất cho mỗi giao dịch. Nếu mã này bắt đầu bằng chữ cái 'c' thì nó biểu thị việc hủy.
+
+-   StockCode: Mã sản phẩm (mặt hàng) - một chuỗi có mô tả như sau: một số nguyên gồm 5 chữ số được gán duy nhất cho từng sản phẩm riêng biệt.
+
+-   Description: Tên sản phẩm (mặt hàng).
+
+-   Quantity: Số lượng của từng sản phẩm (mặt hàng) trên mỗi giao dịch.
+
+-   InvoiceDate: Ngày và giờ lập hóa đơn. Số, ngày và giờ mỗi giao dịch được tạo.
+
+-   UnitPrice: Đơn giá - một số thực: Giá sản phẩm trên mỗi đơn vị bằng đồng bảng Anh.
+
+-   CustomerID: Mã số khách hàng - một chuỗi có mô tả như sau: một số nguyên gồm 5 chữ số được gán duy nhất cho mỗi khách hàng.
+
+-   Country: Tên quốc gia: tên quốc gia nơi mỗi khách hàng cư trú.
+
+## 3.1. Quốc gia
+
+Xem nhanh các quốc gia thực hiện đơn hàng
+
+```{r}
+# Group 'CustomerID', 'InvoiceNo', 'Country'
+temp <- df_initial %>%
+  group_by(CustomerID, InvoiceNo, Country) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  ungroup()
+
+# Đếm các quốc gia
+countries <- temp %>% 
+  count(Country) 
+cat("Number of country: ", length(countries$Country), "\n")
+```
+
+Vẽ bản đồ thống kê chloropleth map
+
+```{r}
+data <- list(
+  type = "choropleth",
+  locations = countries$Country,
+  locationmode = "country names",
+  z = countries$n,
+  text = countries$Country,
+  colorbar = list(title = "Order nb."),
+  colorscale = list(
+    c(0, "rgb(224,255,255)"),
+    c(0.01, "rgb(166,206,227)"),
+    c(0.02, "rgb(31,120,180)"),
+    c(0.03, "rgb(178,223,138)"),
+    c(0.05, "rgb(51,160,44)"),
+    c(0.10, "rgb(251,154,153)"),
+    c(0.20, "rgb(255,255,0)"),
+    c(1, "rgb(227,26,28)")
+  ),
+  reversescale = FALSE
+)
+
+layout <- list(
+  title = "Number of orders per country",
+  geo = list(showframe = TRUE, projection = list(type = "mercator"))
+)
+
+choromap <- plot_ly(z = countries$n, locations = countries$Country, type = "choropleth", locationmode = "country names") %>%
+  layout(title = "Number of orders per country", geo = list(showframe = TRUE, projection = list(type = "mercator")))
+choromap
+```
+
+Ta có thể thấy rằng tập dữ liệu phần lớn bị chi phối bởi các đơn đặt hàng được thực hiện từ Vương quốc Anh. (xấp xỉ 20/400 nghìn đơn)
+
+## 3.2. Khách hàng và Sản phẩm
+
+Dataframe chứa khoảng 400.000 record. Vậy có bao nhiêu khách hàng, sản phẩm và đơn hàng trong dataframe này?
+
+```{r}
+quantity <- data.frame(
+  products = length(unique(df_initial$StockCode)),
+  transactions = length(unique(df_initial$InvoiceNo)),
+  customers = length(unique(df_initial$CustomerID))
+)
+rownames(quantity) <- "quantity"
+quantity
+```
+
+Có thể thấy rằng dữ liệu có 4372 khách hàng và họ đã mua 3684 sản phẩm khác nhau. Tổng số đơn hàng được thực hiện vào khoảng 22000 đơn.
+
+Nhóm sẽ tiếp tục xác định số lượng sản phẩm mua trong mỗi đơn hàng:
+
+```{r}
+# Group 'CustomerID', 'InvoiceNo', đếm số lần xuất hiện của 'InvoiceDate'
+temp <- df_initial %>%
+  group_by(CustomerID, InvoiceNo) %>%
+  summarise(`Number of products` = n(), .groups = 'drop')
+
+nb_products_per_basket <- temp %>%
+  arrange(CustomerID)
+nb_products_per_basket
+```
+
+Từ tập dữ liệu trên, ta có thể thấy:
+
+-   Tiền tố C cho biến InvoiceNo cho biết các đơn hàng đã bị hủy.
+
+-   Có những khách hàng chỉ đến mua một lần và chỉ mua một sản phẩm (ví dụ: số 12346).
+
+-   Có những khách hàng thường xuyên mua số lượng lớn các mặt hàng trong mỗi đơn hàng.
+
+### 3.2.1. Các đơn hàng bị huỷ
+
+```{r}
+nb_products_per_basket$order_canceled <- as.integer(grepl("C", nb_products_per_basket$InvoiceNo))
+nb_products_per_basket
+
+n1 <- sum(nb_products_per_basket$order_canceled)
+n2 <- nrow(nb_products_per_basket)
+cat(sprintf("Number of orders canceled: %d/%d (%.2f%%) \n", n1, n2, n1/n2*100))
+```
+
+Có thể thấy số lượng đơn hàng bị huỷ cũng khá là nhiều (khoảng 16% trên tổng số đơn)
+
+```{r}
+df_initial_sorted <- df_initial %>%
+  arrange(CustomerID) %>%
+  head(5)
+df_initial_sorted
+```
+
+Ở một vài dòng dữ liệu trên, ta có thể thấy rằng khi một đơn hàng bị hủy, ta sẽ có một đơn hàng khác trong dataframe, hầu hết giống hệt nhau ngoại trừ các biến về Số lượng và Ngày lập hóa đơn. Nhóm sẽ quyết định kiểm tra xem điều này có đúng với tất cả các record không.
+
+Để làm điều này, nhóm sẽ tìm các record có chứa số lượng âm (trong cột Quantity) và kiểm tra xem có một đơn hàng nào chỉ ra cùng một số lượng một cách hệ thống (nhưng dương), với cùng một mô tả (ID khách hàng, Mô tả và Đơn giá) hay không:
+
+```{r}
+df_check <- df_initial %>%
+  filter(Quantity < 0) %>%
+  select(CustomerID, Quantity, StockCode, Description, UnitPrice)
+
+for (i in 1:nrow(df_check)) {
+  row <- df_check[i, ]
+  cond <- df_initial %>%
+    filter(
+      CustomerID == row$CustomerID,
+      Quantity == -row$Quantity,
+      Description == row$Description
+    )
+  
+  if (nrow(cond) == 0) {
+    print(row)
+    cat("-----> HYPOTHESIS NOT FULFILLED\n")
+    # giả thiết không hoàn thành
+    break
+  }
+}
+```
+
+Ta thấy rằng giả thuyết ban đầu không được đáp ứng do sự tồn tại của mục 'Discount'. Nhóm sẽ thực hiện kiểm tra lại giả thuyết nhưng lần này loại bỏ mục 'Discount':
+
+```{r}
+df_check <- df_initial %>%
+  filter(Quantity < 0 & Description != 'Discount') %>%
+  select(CustomerID, Quantity, StockCode, Description, UnitPrice)
+
+for (i in 1:nrow(df_check)) {
+  row <- df_check[i, ]
+  cond <- df_initial %>%
+    filter(
+      CustomerID == row$CustomerID,
+      Quantity == -row$Quantity,
+      Description == row$Description
+    )
+  
+  if (nrow(cond) == 0) {
+    print(row)
+    cat("-----> HYPOTHESIS NOT FULFILLED\n")
+    # giả thiết không hoàn thành
+    break
+  }
+}
+```
+
+Một lần nữa, ta thấy rằng giả thuyết ban đầu không được xác minh. Do đó, việc hủy bỏ đơn hàng không nhất thiết phải tương ứng với các đơn đặt hàng đã được thực hiện trước đó.
+
+Đối với những lần hủy không có đối tác, một số trong số đó có thể là do lệnh mua được thực hiện trước tháng 12 năm 2010 (thời điểm nhập cơ sở dữ liệu). Nhóm sẽ tiếp tục thực hiện kiểm tra các đơn hàng hủy và kiểm tra sự tồn tại của các đơn hàng tương ứng:
+
+```{r}
+df_cleaned <- df_initial
+df_cleaned$QuantityCanceled <- as.integer(0)
+```
+
+```{r warning=FALSE}
+entry_to_remove <- c()
+doubtful_entry <- c()
+
+for (i in 1:nrow(df_initial)) {
+  col <- df_initial[i, ]
+  if ((df_initial[i, "Quantity"] > 0) || (df_initial[i, "Description"] == "Discount")) next
+  
+  df_test <- subset(df_initial, 
+                    CustomerID == df_initial[i, "CustomerID"] & 
+                    StockCode == df_initial[i, "StockCode"] & 
+                    InvoiceDate < df_initial[i, "InvoiceDate"] & 
+                    Quantity > 0)
+  
+  if (nrow(df_test) == 0) {
+    doubtful_entry <- c(doubtful_entry, i)
+  } 
+  else if (nrow(df_test) == 1) {
+    df_cleaned[rownames(df_test)[1], "QuantityCanceled"] <- -col['Quantity']
+    entry_to_remove <- c(entry_to_remove, i)
+  } 
+  else if (nrow(df_test) > 1) {
+    df_test <- df_test[order(-as.numeric(rownames(df_test))), ]
+    for (j in 1:nrow(df_test)) {
+      val <- df_test[j, ]
+      if (val['Quantity'] < -col['Quantity']) next
+      df_cleaned[rownames(df_test)[j], 'QuantityCanceled'] <- -col['Quantity']
+      entry_to_remove <- c(entry_to_remove, i)
+      break
+    }
+  }
+}
+```
+
+Trong đoạn code trên, nhóm đã kiểm tra hai trường hợp:
+
+-   lệnh hủy tồn tại mà không có đơn đặt
+
+-   có ít nhất một bản sao của hoá đơn có cùng số lượng với nhau
+
+Chỉ mục của lệnh hủy tương ứng được giữ lần lượt trong doubtful_entry (các dòng dữ liệu nghi ngờ) và entry_to_remove (các dòng dữ liệu loại bỏ) sẽ có kích thước là:
+
+```{r}
+cat("entry_to_remove: ", length(entry_to_remove), "\n")
+cat("doubtful_entry: ", length(doubtful_entry), "\n")
+```
+
+```{r}
+# Loại bỏ các dòng được chọn trong entry_to_remove và doubtful_entry
+df_cleaned <- df_cleaned[-c(entry_to_remove, doubtful_entry), , drop = FALSE]
+
+remaining_entries <- subset(df_cleaned, Quantity < 0 & StockCode != 'D')
+
+cat("Entries to delete: ", nrow(remaining_entries), "\n")
+remaining_entries
+```
+
+### 3.2.2. Giá sản phẩm kèm theo giao dịch
+
+Nhóm sẽ tạo một biến mới cho biết tổng giá của mỗi lần mua hàng:
+
+```{r}
+# tổng tiền mua = đơn giá * (đơn vị mua - đơn vị huỷ đơn mua)
+df_cleaned$TotalPrice <- df_cleaned$UnitPrice * (df_cleaned$Quantity - df_cleaned$QuantityCanceled)
+
+df_cleaned_f <- distinct(df_cleaned) # tạo dataframe df_cleaned_f để dùng cho phần 4.3 và phần 5
+
+df_cleaned[order(df_cleaned$CustomerID), ]
+```
+
+Mỗi dòng trong dataframe đề cập đến giá của một loại sản phẩm duy nhất. Do đó, các đơn đặt hàng được chia thành nhiều dòng. Nhóm thu thập tất cả các mua hàng được thực hiện trong một đơn đặt hàng duy nhất để tính tổng giá trị của đơn hàng:
+
+```{r}
+temp <- aggregate(TotalPrice ~ CustomerID + InvoiceNo, data = df_cleaned, sum)
+colnames(temp)[3] <- "Basket Price"
+basket_price <- temp
+
+df_cleaned$InvoiceDate_int <- as.integer(as.POSIXct(df_cleaned$InvoiceDate))
+temp <- aggregate(InvoiceDate_int ~ CustomerID + InvoiceNo, data = df_cleaned, mean)
+df_cleaned <- subset(df_cleaned, select = -InvoiceDate_int)
+basket_price$InvoiceDate <- as.POSIXct(as.integer(temp$InvoiceDate_int), origin="1970-01-01")
+
+basket_price <- subset(basket_price, basket_price$`Basket Price` > 0)
+basket_price[order(basket_price$CustomerID), ]
+```
+
+```{r}
+price_range <- c(0, 50, 100, 200, 500, 1000, 5000, 50000)
+count_price <- c()
+
+for (i in 1:length(price_range)) {
+  if (i == 1) next
+  val <- sum(basket_price$`Basket Price` < price_range[i] & basket_price$`Basket Price` > price_range[i-1])
+  count_price <- c(count_price, val)
+}
+
+df <- data.frame(
+  Muc_gia = sapply(2:length(price_range), function(i) paste(price_range[i-1], "<.<", price_range[i])),
+  sizes = count_price
+)
+
+# Tính phần trăm
+df$percentages <- df$sizes / sum(df$sizes) * 100
+
+# Vẽ biểu đồ tròn với chú thích phần trăm
+ggplot(df, aes(x = "", y = sizes, fill = Muc_gia)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste(round(percentages, 1), "%")), position = position_stack(vjust = 0.5)) +
+  theme_void() +
+  labs(title = "Phân phối số tiền của các đơn đặt hàng")
+```
+
+Có thể thấy rằng phần lớn các đơn đặt hàng liên quan đến các giao dịch mua tương đối lớn vì có khoảng 65% số lần mua hàng có giá trị vượt quá 200 £.
+
+# 4. Thông tin chi tiết về các danh mục sản phẩm
+
+Trong dataframe, các sản phẩm được xác định duy nhất thông qua cột StockCode. Mô tả ngắn gọn của các sản phẩm được cung cấp trong cột Description. Trong phần này, nhóm sử dụng 2 cột được nên trên để nhóm các sản phẩm thành các danh mục khác nhau.
+
+## 4.1. Những sản phẩm được mua nhiều nhất
+
+Lưu ý: không tính các đơn hàng đã huỷ
+
+```{r}
+df_cleaned %>% 
+  group_by(StockCode, Description) %>% 
+  summarise(count = n(), .groups = 'drop') %>% 
+  arrange(desc(count)) %>% 
+  head() %>%
+  ggplot(aes(x = Description, y = count, fill = count)) + 
+    geom_bar(stat = "identity") + coord_flip() +
+    labs(y = "Số lượng sản phẩn mua", x = "Tên sản phẩm")
+```
+
+## 4.2. Mô tả sản phẩm - Description
+
+Bước đầu tiên, nhóm sẽ trích xuất thông tin từ cột Description:
+
+Thu thập danh sách các sản phẩm:
+
+```{r}
+df_produits <- data.frame(Description = unique(df_initial$Description))
+df_produits
+```
+
+Hàm này nhận bảng dữ liệu làm đầu vào và phân tích nội dung của cột Description bằng cách thực hiện các thao tác sau:
+
+-   Trích xuất các tên (tên riêng, phổ thông) xuất hiện trong mô tả sản phẩm
+-   Đối với mỗi tên, tôi trích xuất gốc của từ và tổng hợp tập hợp các tên được liên kết với gốc từ cụ thể này
+-   Đếm số lần xuất hiện của mỗi gốc từ trong bảng dữ liệu
+-   Khi có nhiều từ được liệt kê cho cùng một gốc từ, tôi coi từ khóa được liên kết với gốc từ này là tên ngắn nhất (điều này luôn chọn từ số ít khi có các biến thể số ít/số nhiều)
+
+```{r}
+is_noun <- function(pos) {
+  pos %in% c("NOUN", "VERB", "PROPN")  # "NOUN", "VERB" và "PROPN" là các loại từ danh từ trong udpipe
+}
+
+keywords_inventory <- function(dataframe, col = 'Description') {
+  tokens <- unlist(tokenize_words(dataframe[[col]]))
+  
+  # load model xử lý tiếng anh
+  ud_model <- udpipe_download_model(language = "english")
+  ud_model <- udpipe_load_model(ud_model$file_model)
+  
+  udpipe_annotated <- udpipe_annotate(ud_model, x = tokens)
+  udpipe_pos <- as.data.frame(udpipe_annotated)
+  
+  keywords_roots  <- list()
+  keywords_select <- list()
+  category_keys   <- list()
+  count_keywords  <- list()
+  
+  for (i in seq_len(nrow(udpipe_pos))) {
+    word <- tolower(as.character(udpipe_pos$token[i]))
+    tag <- as.character(udpipe_pos$upos[i])
+    if (is_noun(tag)) {
+      racine <- wordStem(word, language = "en")
+      if (racine %in% names(keywords_roots)) {
+        keywords_roots[[racine]] <- union(keywords_roots[[racine]], word)
+        count_keywords[[racine]] <- count_keywords[[racine]] + 1
+      } else {
+        keywords_roots[[racine]] <- list(word)
+        count_keywords[[racine]] <- 1
+      }
+    }
+  }
+  
+  for (s in names(keywords_roots)) {
+    if (length(keywords_roots[[s]]) > 1) {
+      min_length <- 1000
+      for (k in keywords_roots[[s]]) {
+        if (nchar(k) < min_length) {
+          clef <- k
+          min_length <- nchar(k)
+        }
+      }
+      category_keys <- c(category_keys, clef)
+      keywords_select[[s]] <- clef
+    } else {
+      category_keys <- c(category_keys, keywords_roots[[s]][1])
+      keywords_select[[s]] <- keywords_roots[[s]][1]
+    }
+  }
+  
+  cat(sprintf("Nb of keywords in variable '%s': %d\n", col, length(category_keys)))
+  return(list(category_keys = category_keys, keywords_roots = keywords_roots, keywords_select = keywords_select, count_keywords = count_keywords))
+}
+```
+
+```{r}
+result <- keywords_inventory(df_produits)
+
+# In thử kết quả tương ứng
+# print(result$category_keys)
+# print(result$keywords_roots)
+# print(head(result$keywords_select, 10))
+# print(head(result$count_keywords, 10))
+```
+
+Việc thực thi hàm này trả về ba biến quan trọng chính:
+
+keywords (hay category_keys): danh sách các từ khóa được trích xuất keywords_roots: một list tượng trung cho từ điển với các khóa là các từ gốc của các từ khóa và các giá trị là danh sách các từ được liên kết với những từ gốc đó count_keywords: một list tượng trung cho từ điển liệt kê số lần mỗi từ được sử dụng
+
+Nhóm chuyển đổi count_keywords thành một danh sách, để sắp xếp các từ khóa theo số lần xuất hiện của chúng:
+
+```{r}
+keywords_select <- result$keywords_select
+count_keywords <- result$count_keywords
+
+list_products <- vector("list", length = length(count_keywords))
+for (i in seq_along(count_keywords)) {
+  list_products[[i]] <- list(keywords_select[[names(count_keywords)[i]]], count_keywords[[i]])
+}
+
+list_products <- list_products[order(sapply(list_products, function(x) x[[2]]), decreasing = TRUE)]
+
+# In thử kết quả
+# print(head(list_products, 5))
+```
+
+Sau đó vẽ biểu đồ thống kê tần suất xuất hiện của các từ khoá:
+
+```{r}
+list <- list_products[order(sapply(list_products, function(x) x[[2]]), decreasing = TRUE)]
+
+# Lấy 25 phần tử đầu tiên từ list đã sắp xếp
+list <- list[1:25]
+
+# Tạo plot tương tự trong Python
+y_axis <- sapply(list, function(x) x[[2]])
+x_axis <- 1:length(list)
+x_label <- unlist(sapply(list, function(x) x[[1]]))
+
+data <- data.frame (
+  x_label,
+  y_axis
+)
+
+data$x_label <- reorder(data$x_label, data$y_axis)
+
+ggplot(data, aes(x = x_label, y = y_axis)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(y = "Tần suất xuất hiện", x = "", title = "Tần suất xuất hiện từ (25 từ khoá nhiều nhất)") +
+  theme_minimal()
+```
+
+## 4.3. Xác định danh mục sản phẩm
+
+Danh sách trên thu được chứa hơn (số này chạy 500k dòng mới biết) từ khóa và các từ khóa phổ biến nhất xuất hiện trong hơn 200 sản phẩm. Tuy nhiên, khi xem xét nội dung của danh sách, ta có thể nhận thấy một số tên là không cần thiết. Một số khác không chứa thông tin, như các từ chỉ màu sắc. Do đó, nhóm sẽ thực hiện loại bỏ những từ này khỏi phân tích tiếp theo và cũng quyết định chỉ xem xét các từ xuất hiện hơn 13 lần.
+
+```{r}
+list_products <- list()
+
+for (i in seq_along(count_keywords)) {
+  k <- names(count_keywords)[i]
+  v <- count_keywords[[k]]
+  
+  word <- keywords_select[[k]]
+  
+  if (word %in% c('pink', 'blue', 'tag', 'green', 'orange')) next
+  if (nchar(word) < 3 || v < 13) next
+  if (grepl("\\+|/", word)) next  # Sử dụng grepl thay vì str_detect
+  
+  list_products <- append(list_products, list(c(word, v)))
+}
+
+# Sắp xếp list_products theo giảm dần của cột thứ hai
+list_products <- list_products[order(sapply(list_products, "[[", 2), decreasing = TRUE)]
+
+cat('Retained keywords:', length(list_products), '\n')
+```
+
+### 4.3.1 Mã hoá dữ liệu
+
+NOTE: sửa tên biến list_prod_desc sau khi hoàn thành 100%
+
+Sử dụng những từ khóa này để tạo các nhóm sản phẩm. Đầu tiên, xác định ma trận 𝑋 như sau:
+
+|           | key 1     | ... | key j     | ... | key N     |
+|:---------:|-----------|-----|-----------|-----|-----------|
+| product 1 | $a_{1,1}$ |     |           |     | $a_{1,N}$ |
+|    ...    |           |     | ...       |     |           |
+| product i | ...       |     | $a_{i,j}$ |     | ...       |
+|    ...    |           |     | ...       |     |           |
+| product M | $a_{M,1}$ |     |           |     | $a_{M,N}$ |
+
+Hệ số $a_{i,j}$ là 1 nếu mô tả của sản phẩm ${i}$ chứa từ ${j}$, và là 0 trong trường hợp ngược lại.
+
+```{r}
+list_prod_desc <- unique(df_cleaned$Description)
+X <- data.frame(matrix(0, nrow = length(list_prod_desc), ncol = length(list_products)))
+for (i in 1:length(list_products)) {
+  key <- list_products[[i]][[1]]
+  occurence <- list_products[[i]][[2]]
+  v <- rep(0, length(list_prod_desc))
+  for (j in 1:length(list_prod_desc))
+  {
+    if ( str_detect(list_prod_desc[j ], toupper(key)))
+    {
+      X[j,i] <- 1
+    }
+  }
+  colnames(X)[i] <- key
+}
+```
+
+Ma trận 𝑋 chỉ ra các từ được chứa trong mô tả của các sản phẩm bằng cách sử dụng nguyên tắc mã hóa one-hot. Trong thực tế, nhóm đã phát hiện rằng việc đưa ra khoảng giá sẽ dẫn đến các nhóm cân đối hơn về số lượng phần tử. Do đó, nhóm sẽ thêm 6 cột bổ sung vào ma trận này và chỉ ra khoảng giá của các sản phẩm:
+
+```{r}
+threshold <- c(0, 1, 2, 3, 5, 10)
+label_col <- character(0)
+
+for (i in seq_along(threshold)) {
+  if (i == length(threshold)) {
+    col <- paste('.>', threshold[i], sep = '')
+  } else {
+    col <- paste(threshold[i], '<.<', threshold[i + 1], sep = '')
+  }
+  label_col <- c(label_col, col)
+  col_idx <- which(colnames(X) == col)
+  X[, col_idx] <- 0
+}
+
+for (i in seq_along(list_prod_desc)) {
+  prod <- list_prod_desc[i]
+  prix <- mean(df_cleaned[df_cleaned$Description == prod, 'UnitPrice'])
+  j <- 1
+  while (prix > threshold[j]) {
+    j <- j + 1
+    if (j == length(threshold) + 1) break
+  }
+  X[i, label_col[j - 1]] <- 1
+}
+X[is.na(X)] <- 0
+
+X
+```
+
+Và để chọn các khoảng phù hợp, nhóm sẽ kiểm tra số lượng sản phẩm trong các nhóm khác nhau:
+
+```{r}
+cat(sprintf("%-8s %-20s \n", 'Range', 'Number of products'), paste(rep("-", 20), collapse = ""), "\n")
+
+for (i in seq_along(threshold)) {
+  if (i == length(threshold)) {
+    col <- sprintf('.>%s', threshold[i])
+  } else {
+    col <- sprintf('%s<.<%s', threshold[i], threshold[i+1])
+  }
+  cat(sprintf("%-10s  %-20s \n", col, sum(X[,col])))
+}
+```
+
+### 4.3.2. Phân cụm sản phẩm
+
+Trong phần này, nhóm sẽ phân cụm các sản phẩm thành các cụm khác nhau. Để xác định (xấp xỉ) số lượng cụm tốt nhất đại diện cho dữ liệu, nhóm sử dụng điểm silhouette:
+
+```{r}
+matrix <- as.matrix(X)
+
+for (n_clusters in 3:9) {
+  kmeans_result <- kmeans(matrix, centers = n_clusters, nstart = 30)
+  clusters <- kmeans_result$cluster
+  silhouette_vals <- silhouette(clusters, dist(matrix))
+  silhouette_avg <- mean(silhouette_vals[, 3])
+  cat("For n_clusters =", n_clusters, "The average silhouette_score is :", silhouette_avg, "\n")
+}
+```
+
+Điểm silhouette cho 5 cụm cao nhất (*sau nhiều lần chạy, nhóm nhận thấy cụm 5 luôn cho điểm silhoutte tốt nhất, bên cạnh đó, khi thực hiện vòng lặp với 5 cụm, nhóm cũng tìm được điểm silhoutte cao nhất cho 5 cụm là 0.1476137*). Nếu ta chọn chia nhiều cụm hơn, thì số lượng dữ liệu trong mỗi cụm sẽ khá là ít, do đó, chọn 5 cụm là lựa chọn tối ưu.
+
+Tiếp đến, nhóm sẽ thực hiện lặp với 5 cụm mục đích để tìm lại điểm silhouette trung bình của 5 cụm như trên:
+
+```{r}
+n_clusters <- 5
+silhouette_avg <- -1
+
+while (silhouette_avg <= 0.1476137) { # thay điểm silhouette tốt nhất, dùng toán tử <= để có thể tìm được điểm silhouette tốt hơn
+  kmeans_result <- kmeans(matrix, centers = n_clusters, nstart = 30)
+  clusters <- kmeans_result$cluster
+  silhouette_vals <- silhouette(clusters, dist(matrix))
+  silhouette_avg <- mean(silhouette_vals[, 3])
+  cat("For n_clusters =", n_clusters, "The average silhouette_score is :", silhouette_avg, "\n")
+}
+```
+
+### 4.3.3. Đặc điểm hóa nội dung của các cụm (clusters)
+
+```{r}
+table(clusters)
+```
+
+#### a. Điểm Silhouette nội cụm
+
+```{r}
+# Hàm để chọn ngẫu nhiên n màu từ danh sách màu
+select_random_colors <- function(n) {
+  list_of_colors <- c("red", "firebrick", "darkred", "orange", "orangered", "tomato", "yellow", "gold", "goldenrod", "lawngreen", "green", "limegreen", "darkgreen", "dodgerblue", "blue", "mediumblue", "darkslateblue", "violet", "blueviolet", "darkviolet", "purple", "darkorchid", "mediumpurple")
+  all_colors <- list_of_colors[!grepl("\\d", list_of_colors)]
+  if (n > length(all_colors)) {
+    return (NULL)
+  } else {
+    random_colors <- sample(all_colors, n)  # Chọn ngẫu nhiên n màu
+    return(random_colors)  # Trả về danh sách n màu ngẫu nhiên
+  }
+}
+
+random_colors <- select_random_colors(n_clusters)
+
+# Hàm vẽ biểu đồ silhouette nội cụm
+graph_component_silhouette <- function(n_clusters, lim_x, mat_size, sample_silhouette_values, clusters) {
+  
+  y_lower <- 10
+  data <- data.frame()
+  
+  for (i in 1:n_clusters) {
+    ith_cluster_silhouette_values <- sample_silhouette_values[clusters == i]
+    ith_cluster_silhouette_values <- sort(ith_cluster_silhouette_values)
+    size_cluster_i <- length(ith_cluster_silhouette_values)
+    y_upper <- y_lower + size_cluster_i - 1
+    
+    x_coords <- c(0, ith_cluster_silhouette_values, 0)
+    y_coords <- c(y_lower, seq(y_lower, y_upper), y_upper)
+    
+    cluster_data <- data.frame(
+      x = x_coords,
+      y = y_coords,
+      cluster = as.character(i)
+    )
+    
+    data <- rbind(data, cluster_data)
+    
+    y_lower <- y_upper + 10
+  }
+  
+  ggplot(data, aes(x = x, y = y, group = cluster, fill = cluster)) +
+    geom_polygon(color = "black", size = 0) +
+    scale_fill_manual(values = random_colors) +
+    labs(x = "Silhouette coefficient values", y = "Cluster label") +
+    theme_minimal()
+}
+```
+
+```{r}
+clusters_graph <- clusters
+
+sample_silhouette_values <- silhouette(clusters_graph, dist(matrix))[, 3]
+
+graph_component_silhouette(n_clusters, c(-0.07, 0.33), nrow(X), sample_silhouette_values, clusters_graph)
+```
+
+#### b. Biểu đồ WordCloud
+
+```{r}
+temp_list <- as.data.frame(list_prod_desc)
+
+list_words <- unlist(lapply(list_products, function(x) x[[1]]))
+
+occurence <- vector("list", n_clusters)
+
+for (i in 1:n_clusters) {
+  list_cluster <- temp_list[clusters_graph == i, , drop = FALSE]
+
+  temp_dict <- list()
+  for (word in list_words) {
+    if (word %in% c('art', 'set', 'heart', 'pink', 'blue', 'tag')) next
+
+    temp_dict[word] <- sum(grepl(word, tolower(as.character(list_cluster[, 1]))))
+  }
+
+  occurence[[i]] <- temp_dict
+}
+```
+
+```{r}
+cluster_no <- 1 # chọn cluster để vẽ (từ 1 đến n_clusters)
+
+temp <- occurence[[cluster_no]]
+df <- data.frame(word = names(temp), freq = unlist(temp))
+color <- as.character(random_colors[cluster_no])
+wordcloud2(data=df, color = color)
+```
+
+```{r}
+cluster_no <- 2 # chọn cluster để vẽ (từ 1 đến n_clusters)
+
+temp <- occurence[[cluster_no]]
+df <- data.frame(word = names(temp), freq = unlist(temp))
+color <- as.character(random_colors[cluster_no])
+wordcloud2(data=df, color = color)
+```
+
+```{r}
+cluster_no <- 3 # chọn cluster để vẽ (từ 1 đến n_clusters)
+
+temp <- occurence[[cluster_no]]
+df <- data.frame(word = names(temp), freq = unlist(temp))
+color <- as.character(random_colors[cluster_no])
+wordcloud2(data=df, color = color)
+```
+
+```{r}
+cluster_no <- 4 # chọn cluster để vẽ (từ 1 đến n_clusters)
+
+temp <- occurence[[cluster_no]]
+df <- data.frame(word = names(temp), freq = unlist(temp))
+color <- as.character(random_colors[cluster_no])
+wordcloud2(data=df, color = color)
+```
+
+```{r}
+cluster_no <- 5 # chọn cluster để vẽ (từ 1 đến n_clusters)
+
+temp <- occurence[[cluster_no]]
+df <- data.frame(word = names(temp), freq = unlist(temp))
+color <- as.character(random_colors[cluster_no])
+wordcloud2(data=df, color = color)
+```
+
+# 5. Phân loại khách hàng
+
+## 5.1. Định dạng dữ liệu
+
+Trong phần trước đó, các sản phẩm khác nhau đã được nhóm thành 5 cụm. Để chuẩn bị phần còn lại của phân tích, bước đầu tiên bao gồm việc nhập thông tin này vào bảng dữ liệu. Để làm điều này, nhóm tạo thêm cột hạng mục categ_product trong đó tôi chỉ định cụm của mỗi sản phẩm:
+
+```{r}
+corresp <- setNames(clusters, list_prod_desc)
+
+# Thêm cột 'categ_product' vào df_cleaned
+df_cleaned$categ_product <- corresp[df_cleaned$Description]
+
+# Hiển thị dữ liệu sau khi thêm cột mới
+df_cleaned
+```
+
+### 5.1.1. Nhóm các sản phẩm
+
+Tạo các biến categ_N (với [categ_product) chứa số tiền đã chi tiêu trong mỗi danh mục sản phẩm:
+
+```{r}
+for (i in 1:5) {
+  col <- paste("categ_", i, sep = "")
+  df_temp <- df_cleaned[df_cleaned$categ_product == i, ]
+  price_temp <- (df_temp$UnitPrice * (df_temp$Quantity - df_temp$QuantityCanceled))
+  price_temp <- ifelse(price_temp > 0, price_temp, 0)
+  
+  df_cleaned[[col]] <- 0
+  
+  # Tạo cột mới chỉ khi có dữ liệu
+  if (length(price_temp) > 0) {
+    df_cleaned[df_cleaned$categ_product == i, col] <- price_temp
+  }
+}
+
+df_cleaned
+```
+
+```{r}
+basket_price <- df_cleaned %>%
+  group_by(CustomerID, InvoiceNo, InvoiceDate) %>%
+  summarise(
+    'Basket Price' = sum(TotalPrice),
+    categ_1 = sum(categ_1),
+    categ_2 = sum(categ_2),
+    categ_3 = sum(categ_3),
+    categ_4 = sum(categ_4),
+    categ_5 = sum(categ_5)
+  )
+
+basket_price
+```
+
+### 5.1.2. Kết hợp đơn hàng của người tiêu dùng
+
+Nhóm các mục khác nhau mà tương ứng với cùng một người dùng. Nhóm xác định số lần mua hàng của người dùng, cũng như các số lượng tối thiểu, tối đa, trung bình và tổng số tiền đã chi trả trong tất cả các lần mua hàng:
+
+```{r}
+last_date <- as.POSIXct(max(basket_price$InvoiceDate), format = "%m/%d/%Y %H:%M")
+last_date
+
+transactions_per_user <- basket_price %>%
+  group_by(CustomerID) %>%
+  summarise(
+    count = n(),
+    min = min(`Basket Price`),
+    max = max(`Basket Price`),
+    mean = mean(`Basket Price`),
+    sum = sum(`Basket Price`),
+    categ_1 = (sum(categ_1) / sum) * 100,
+    categ_2 = (sum(categ_2) / sum) * 100,
+    categ_3 = (sum(categ_3) / sum) * 100,
+    categ_4 = (sum(categ_4) / sum) * 100,
+    categ_5 = (sum(categ_5) / sum) * 100
+  )
+
+transactions_per_user
+```
+
+Cuối cùng, nhóm định nghĩa hai biến bổ sung làm cho chúng cho biết số ngày trôi qua kể từ lần mua đầu tiên (FirstPurchase) và số ngày kể từ lần mua cuối cùng (LastPurchase):
+
+```{r}
+last_date <- as.POSIXct(max(basket_price$InvoiceDate), format = "%m/%d/%Y %H:%M")
+last_date
+
+first_registration <- basket_price %>%
+  group_by(CustomerID) %>%
+  summarise(FirstPurchase = min(InvoiceDate)) %>%
+  ungroup() %>%
+  mutate(FirstPurchase = as.integer(round(difftime(last_date, FirstPurchase, units = "days"))))
+
+last_purchase <- basket_price %>%
+  group_by(CustomerID) %>%
+  summarise(LastPurchase = max(InvoiceDate)) %>%
+  ungroup() %>%
+  mutate(LastPurchase = as.integer(round(difftime(last_date, LastPurchase, units = "days"))))
+
+transactions_per_user[["LastPurchase"]] <- last_purchase$LastPurchase
+transactions_per_user[["FirstPurchase"]] <- first_registration$FirstPurchase
+
+transactions_per_user <- na.omit(transactions_per_user)
+
+transactions_per_user
+```
+
+Một danh mục khách hàng đặc biệt quan trọng là những khách hàng chỉ thực hiện một lần mua. Trong phần này, nhóm nhận thấy rằng loại khách hàng này chiếm 1/3 số lượng khách hàng được liệt kê:
+
+```{r}
+# Tính số lượng khách hàng có giao dịch duy nhất và phần trăm tương ứng
+n1 <- sum(transactions_per_user$count == 1)
+n2 <- nrow(transactions_per_user)
+percentage <- n1 / n2 * 100
+
+# Hiển thị kết quả
+cat(sprintf("Số lượng khách hàng với giao dịch duy nhất: %d/%d (%.2f%%)\n", n1, n2, percentage))
+```
+
+## 5.2. Tạo danh mục khách hàng
+
+### 5.2.1. Mã hoá - định dạng dữ liệu
+
+```{r}
+list_cols <- c('count', 'min', 'max', 'mean', 'categ_1', 'categ_2', 'categ_3', 'categ_4', 'categ_5')
+
+# Tạo một bản sao của transactions_per_user
+selected_customers <- transactions_per_user
+
+# Chuyển đổi thành ma trận
+matrix <- as.matrix(selected_customers[, list_cols])
+```
+
+```{r}
+# Tính mean và standard deviation của từng cột
+means <- colMeans(matrix)
+std_devs <- apply(matrix, 2, sd)
+
+# Chuẩn hóa dữ liệu theo z-score
+scaled_matrix <- scale(matrix, center = means, scale = std_devs)
+
+# In ra giá trị mean của từng biến
+cat("variables mean values: \n",  "\n", means, "\n")
+
+# In ra ma trận sau khi được chuẩn hóa
+# scaled_matrix
+```
+
+### 5.2.2. Tạo danh mục khách hàng
+
+Nhóm định nghĩa các cụm khách hàng từ ma trận đã được chuẩn hóa đã được định nghĩa trước đó và sử dụng thuật toán k-means. Chọn số cụm dựa trên điểm silhouette và tìm thấy rằng điểm số tốt nhất được đạt được với 11 cụm:
+
+```{r warning=FALSE}
+n_clusters <- 11
+silhouette_avg <- -1
+
+while (silhouette_avg <= 0.218421) {
+  kmeans_result <- kmeans(scaled_matrix, centers = n_clusters, nstart = 30)
+  clusters_clients <- kmeans_result$cluster
+  silhouette_vals <- silhouette(clusters_clients, dist(scaled_matrix))
+  silhouette_avg <- mean(silhouette_vals[, 3])
+  cat(sprintf("Silhouette score: %f\n", silhouette_avg))
+}
+```
+
+Trước tiên, nhóm xem số lượng khách hàng trong mỗi cụm:
+
+```{r}
+table(clusters_clients)
+```
+
+```{r}
+nrow(scaled_matrix)
+```
+
+#### a. Điểm Silhoutte nội cụm
+
+Tương tự như với các danh mục sản phẩm, một cách khác để đánh giá chất lượng của sự phân tách là xem các điểm silhouette trong các cụm khác nhau:
+
+```{r}
+clusters_graph <- clusters_clients
+
+random_colors <- select_random_colors(n_clusters)
+
+sample_silhouette_values <- silhouette(clusters_graph, dist(scaled_matrix))[, 3]
+
+graph_component_silhouette(n_clusters, c(-0.15, 0.55), nrow(scaled_matrix), sample_silhouette_values, clusters_graph)
+```
+
+#### b. Hình thái khách hàng
+
+```{r}
+# Gán cột 'cluster' từ clusters_clients vào selected_customers
+selected_customers$cluster <- clusters_clients
+selected_customers
+```
+
+```{r}
+test_df <- list()
+
+for (i in 1:n_clusters) {
+  test <- selected_customers[selected_customers$cluster == i,]
+  size <- nrow(test)
+  test <- subset(test, select = -c(CustomerID))
+  test <- as.list(colMeans(test))
+  test$size <- size
+  test_df[[i]] <- test
+}
+
+merged_df <- do.call(rbind, lapply(test_df, as.data.frame))
+merged_df
+```
+
+Tổng quan về nội dung của mỗi cụm:
+
+```{r}
+for (i in 1:n_clusters) {
+  df_percent <- subset(merged_df, select = -c(min, max, LastPurchase, FirstPurchase, size, cluster)) %>%
+    mutate_all(function(x) (x / sum(x)) * 100)
+  
+  df_radar <- rbind(rep(100, length(df_percent)), rep(0, length(df_percent)), df_percent[i, ])
+  
+  radarchart(
+    df_radar,
+    axistype = 1,
+    
+    #custom polygon
+    pcol = random_colors[i],
+    # pfcol = random_colors[i],
+    plwd = 0.8,
+    
+    title = paste("Cluster nº", i),
+    
+    #custom the grid
+    cglcol = "grey",
+    cglty = 1,
+    axislabcol = "grey",
+    caxislabels = seq(0, 100, 25),
+    cglwd = 0.8,
+    
+    #custom labels
+    vlcex = 1
+  )
+}
+```
+
+## 5.3. Phân tích hành vi mua hàng
+
+Phần 5.3 này sẽ phân tích về:
+
+TotalSales: Tổng giá trị tất cả đơn hàng mà khách hàng đã mua.
+
+OrderCount: Số lượng đơn hàng mà khách hàng đã đặt.
+
+AvgOrderVal: Giá trị trung bình mỗi đơn hàng của khách hàng.
+
+```{r}
+df_customer <- df_cleaned_f %>%
+  group_by(CustomerID) %>%
+  summarize(TotalSales = sum(TotalPrice),
+            OrderCount = length(unique(InvoiceDate))) %>%
+  mutate(AvgOrderVal = TotalSales / OrderCount)
+df_customer
+```
+
+```{r}
+df_rank_cus <- df_customer %>%
+  mutate(
+    TotalSales = rank(TotalSales),
+    OrderCount = rank(OrderCount,
+                      ties.method = "first"),
+    AvgOrderVal = rank(AvgOrderVal)
+  )
+
+# Chuẩn hoá dữ liệu
+df_scale_cus <- df_rank_cus %>%
+  mutate(
+    TotalSales = scale(TotalSales),
+    OrderCount = scale(OrderCount),
+    AvgOrderVal = scale(AvgOrderVal)
+  )
+
+#look at the summary of the normalized data
+summary(df_scale_cus)
+sapply(df_scale_cus, sd)
+```
+
+Giá trị được tập trung sau khi chuẩn hoá có độ lệch chuẩn là 1. Bây giờ, đem dữ liệu này để phân tích phân cụm (dùng k-means):
+
+```{r}
+for(n_clusters in 3:9) {
+  cluster <- kmeans(df_scale_cus[c("TotalSales", "OrderCount", "AvgOrderVal")], n_clusters)
+  silhouette_avg <- mean(silhouette(cluster$cluster,
+                                     dist(df_scale_cus[c("TotalSales", "OrderCount", "AvgOrderVal")],
+                                          method = "euclidean"))[, 3])
+  cat("For n_clusters =", n_clusters, "The average silhouette_score is :", silhouette_avg, "\n")
+}
+```
+
+```{r}
+n_clusters <- 4
+silhouette_avg <- -1
+
+# 4: 0.4142249
+# 3: 0.4156512
+
+while (silhouette_avg <= 0.4142249) { # chỗ này thay điểm silhouette tốt nhất, dùng toán tử <= để có thể tìm được điểm silhouette tốt hơn
+  cluster <- kmeans(df_scale_cus[c("TotalSales", "OrderCount", "AvgOrderVal")], n_clusters)
+  silhouette_avg <- mean(silhouette(cluster$cluster,
+                                     dist(df_scale_cus[c("TotalSales", "OrderCount", "AvgOrderVal")],
+                                          method = "euclidean"))[, 3])
+  cat("For n_clusters =", n_clusters, "The average silhouette_score is :", silhouette_avg, "\n")
+}
+```
+
+```{r}
+df_scale_cus$Cluster <- cluster$cluster
+
+ggplot(df_scale_cus, aes(x = AvgOrderVal, y = OrderCount, color = Cluster)) +
+  geom_point() +
+  theme_minimal()
+```
+
+# 6. Phân tích và dự đoán doanh thu
+
+```{r}
+# Dùng dataframe df_cleaned_f đã copy từ chunk 24
+df_cleaned_f$Country <- as.factor(df_cleaned_f$Country)
+df_cleaned_f$date <- as.Date(df_cleaned_f$InvoiceDate)
+df_cleaned_f$day <- as.factor(day(df_cleaned_f$InvoiceDate))
+df_cleaned_f$month <- as.factor(month(df_cleaned_f$InvoiceDate))
+df_cleaned_f$year <- as.factor(year(df_cleaned_f$InvoiceDate))
+levels(df_cleaned_f$year) <- c(2010, 2011)
+df_cleaned_f$hourOfDay <- as.factor(hour(df_cleaned_f$InvoiceDate))
+df_cleaned_f$dayOfWeek <- as.factor(wday(df_cleaned_f$InvoiceDate, label = TRUE))
+
+df_cleaned_f
+```
+
+## 6.1. Phân tích doanh thu
+
+### 6.1.1. Doanh thu hằng tháng
+
+```{r}
+monthly_sale <- df_cleaned_f %>% 
+  group_by(month, year) %>%
+  summarise(TotalPrice = sum(TotalPrice), .groups = 'drop') %>%
+  arrange(desc(TotalPrice)) %>%
+  ungroup()
+
+ggplot(data = monthly_sale, aes(
+  x = reorder(as.factor(month), TotalPrice),
+  y = TotalPrice,
+  fill = month
+)) +
+  geom_bar(stat = "identity") +
+  labs(y = "Doanh thu (£)", x = "Tháng",
+       title = "Doanh thu hằng tháng") +
+  coord_flip() +
+  theme_minimal()
+```
+
+### 6.1.2. Doanh số bán hàng diễn ra vào ngày trong tuần
+
+```{r}
+week_sale <- df_cleaned_f %>% 
+  group_by(dayOfWeek) %>%
+  summarise(TotalPrice = sum(TotalPrice), .groups = 'drop') %>%
+  arrange(desc(TotalPrice)) %>%
+  ungroup()
+
+ggplot(data = week_sale, aes(
+  x = reorder(as.factor(dayOfWeek), TotalPrice),
+  y = TotalPrice,
+  fill = dayOfWeek
+)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Ngày trong tuần", y = "Doanh thu (£)",
+       title = "Doanh số bán hàng diễn ra vào ngày trong tuần") +
+  coord_flip() +
+  theme_minimal()
+```
+
+### 6.1.3. Doanh số bán hàng diễn ra vào thời điểm trong ngày
+
+```{r}
+hour_sale <- df_cleaned_f %>% 
+  group_by(hourOfDay) %>%
+  summarise(TotalPrice = sum(TotalPrice), .groups = 'drop') %>%
+  arrange(desc(TotalPrice)) %>%
+  ungroup()
+
+ggplot(data = hour_sale, aes(
+  x = reorder(as.factor(hourOfDay), TotalPrice),
+  y = TotalPrice,
+  fill = hourOfDay
+)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Giờ", y = "Doanh thu (£)",
+       title = "Doanh số bán hàng diễn ra vào thời điểm trong ngày") +
+  coord_flip() +
+  theme_minimal()
+```
+
+### 6.1.4. Tổng doanh thu theo ngày trong tháng
+
+```{r}
+monthday_sale <- df_cleaned_f %>% 
+  group_by(month, day) %>%
+  summarise(TotalPrice = sum(TotalPrice), .groups = 'drop') %>%
+  arrange(month, day) %>%
+  ungroup()
+
+ggplot(monthday_sale, aes(fill = month, y = TotalPrice, x = day)) +
+  labs(x = "Ngày", y = "Doanh thu (£)",
+       title = "Doanh số bán hàng diễn ra vào thời điểm trong ngày") +
+  geom_bar(position = "stack", stat = "identity") +
+  coord_flip() +
+  theme_minimal()
+```
+
+## 6.2. Phân tích và dự đoán doanh thu
+
+```{r}
+sale_data <- df_cleaned_f %>%
+  group_by(date) %>%
+  summarise(revenue = sum(TotalPrice), .groups = 'drop')
+
+ggplot(sale_data, aes(x = date, y = revenue)) + 
+  geom_line() + 
+  geom_smooth(method = 'auto', se = FALSE) + 
+  labs(x = 'Ngày', y = 'Doanh thu (£)', title = 'Doanh thu theo ngày') +
+  theme_minimal()
+```
+
+```{r}
+sale_data <- sale_data %>% rename(ds = date, y = revenue)
+sale_data
+```
+
+```{r}
+weekend <- data.frame(
+  holiday = 'weekend',
+  ds = as.Date(c('2010-12-04', '2010-12-11', '2010-12-18',
+                 '2011-01-08', '2011-01-15', '2011-01-22',
+                 '2011-01-29', '2011-02-05', '2011-02-12',
+                 '2011-02-19', '2011-02-26', '2011-03-05',
+                 '2011-03-12', '2011-03-12', '2011-03-19',
+                 '2011-03-26', '2011-04-02', '2011-04-09',
+                 '2011-04-16', '2011-04-23', '2011-04-30',
+                 '2011-05-07', '2011-05-14', '2011-05-21',
+                 '2011-05-28', '2011-06-04', '2011-06-11',
+                 '2011-04-30', '2011-06-18', '2011-06-25',
+                 '2011-07-02', '2011-07-09', '2011-07-16',
+                 '2011-07-23', '2011-07-30', '2011-08-06',
+                 '2011-08-13', '2011-08-20', '2011-08-27',
+                 '2011-09-03', '2011-09-10', '2011-09-17',
+                 '2011-09-24', '2011-10-01', '2011-10-08',
+                 '2011-10-15', '2011-10-22', '2011-10-29',
+                 '2011-11-05', '2011-11-12', '2011-11-19',
+                 '2011-11-26', '2011-12-03')),
+  lower_window = 0,
+  upper_window = 1
+)
+festival <- data.frame(
+  holiday = 'festival',
+  ds = as.Date(c('2010-12-24', '2010-12-25', '2010-12-26',
+                 '2010-12-27', '2010-12-28', '2010-12-29',
+                 '2010-12-30', '2010-12-31', '2011-01-01',
+                 '2011-01-02', '2011-01-03', '2011-04-22',
+                 '2011-04-24', '2011-04-25', '2011-04-29',
+                 '2011-05-02', '2011-05-30', '2011-08-29')),
+  lower_window = 0,
+  upper_window = 1
+)
+holidays <- bind_rows(weekend, festival)
+holidays
+```
+
+```{r}
+model <- prophet(sale_data, holidays = holidays, yearly.seasonality=FALSE, daily.seasonality=FALSE)
+future <- make_future_dataframe(model, periods = 80)
+tail(future)
+# model <- add_country_holidays(model, country_name = 'UK')
+# model <- fit.prophet(model, sale_data)
+
+model$train.holiday.names
+forecast <- predict(model, future)
+prophet_plot_components(model, forecast)
+plot(model, forecast)
+```
+
+# 7. Sử dụng các model để phân loại khách hàng
+
+Trong phần này, mục tiêu sẽ là điều chỉnh một bộ phân loại sẽ phân loại người tiêu dùng vào các loại khách hàng khác nhau đã được thiết lập ở phần trước. Mục tiêu là làm cho phân loại này có thể thực hiện được ngay từ lần truy cập đầu tiên.
+
+Vì mục tiêu là xác định lớp mà một khách hàng thuộc về và điều này, ngay từ lần truy cập đầu tiên, nhóm chỉ giữ lại các biến mô tả nội dung của giỏ hàng và không xem xét các biến liên quan đến tần suất truy cập hoặc biến thiên của giá giỏ hàng theo thời gian:
+
+```{r}
+X <- subset(selected_customers, select = c(mean, categ_1, categ_2, categ_3, categ_4, categ_5))
+# X
+Y <- c(selected_customers$cluster)
+# Y
+```
+
+Cuối cùng, nhóm chia bộ dữ liệu thành tập train và tập test:
+
+```{r}
+# X là dữ liệu đặc trưng, Y là nhãn hoặc biến phản hồi
+# train_size = 0.8 chỉ định tỷ lệ cho tập huấn luyện (80%)
+
+# Chia dữ liệu thành tập huấn luyện (80%) và tập kiểm tra (20%)
+split <- createDataPartition(Y, times = 1, p = 0.8, list = FALSE)
+
+X_train <- X[split,]
+# X_train
+X_test <- X[-split,]
+# X_test
+Y_train <- Y[split]
+# Y_train
+Y_test <- Y[-split]
+# Y_test
+```
+
+## 7.1. Support Vector Machine
+
+```{r}
+# Combine X_train and Y_train into one dataframe
+train_data <- cbind(X_train, Y_train)
+
+# Set up the parameters
+tuneGrid <- expand.grid(C = 10 ^ seq(-2, 2, length.out = 10))
+
+# Train the SVM model with linear kernel using cross-validation
+svm_model <-
+  train(
+    factor(Y_train) ~ .,
+    data = train_data,
+    method = "svmLinear",
+    trControl = trainControl(method = "cv", number = 5),
+    tuneGrid = tuneGrid
+  )
+
+# Predict on the test data
+test_data <- cbind(X_test, Y_test)
+predictions <- predict(svm_model, newdata = test_data)
+# Confusion matrix
+
+conf_matrix <- confusionMatrix(predictions, factor(Y_test))
+conf_matrix$table
+# Calculate accuracy
+accuracy_svm <- mean(predictions == Y_test) * 100
+cat("Accuracy:", accuracy_svm, "%\n\n")
+
+plot(svm_model)
+```
+
+## 7.2. k-Nearest Neighbors
+
+```{r}
+knn_model <-
+  train(as.factor(Y_train) ~ .,
+        data = cbind(X_train, Y_train),
+        method = "knn")
+
+# Dự đoán trên tập kiểm thử
+predictions <- predict(knn_model, newdata = X_test)
+
+# Đánh giá mô hình
+conf_matrix_knn <- table(predictions, Y_test)
+accuracy_knn <- sum(diag(conf_matrix_knn)) / sum(conf_matrix_knn)
+print(conf_matrix_knn)
+cat("Accuracy:", accuracy_knn * 100, "%\n\n")
+plot(knn_model)
+```
+
+## 7.3. Decision Tree
+
+```{r}
+dt_model <-
+  rpart(Y_train ~ .,
+        data = cbind(X_train, Y_train),
+        method = "class")
+
+print(dt_model)
+
+# Vẽ cây quyết định (Decision Tree)
+plot(dt_model)
+text(dt_model, pretty = 0)
+
+# Dự đoán trên tập huấn luyện
+predictions <- predict(dt_model, X_test, type = "class")
+
+# Đánh giá hiệu suất
+confusion_matrix <- table(predictions, Y_test)
+print(confusion_matrix)
+
+# Tính accuracy
+accuracy_dt <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+cat("Accuracy:", accuracy_dt * 100, "%\n\n")
+```
+
+## 7.4. Random Forest
+
+```{r}
+# Xây dựng mô hình Random Forest
+model_rf <- randomForest(X_train, as.factor(Y_train) , ntree = 300)
+
+# In thông tin về mô hình
+print(model_rf)
+
+# Dự đoán trên tập kiểm tra
+predictions_rf <- predict(model_rf, newdata = X_test)
+
+# Đánh giá hiệu suất
+confusion_matrix_rf <- table(predictions_rf, Y_test)
+print(confusion_matrix_rf)
+
+# Tính accuracy
+accuracy_rf <- sum(diag(confusion_matrix_rf)) / sum(confusion_matrix_rf)
+cat("Accuracy:", accuracy_rf * 100, "%\n\n")
+```
+
+# 8. Kết luận
+
+Bài báo cáo dựa trên một cơ sở dữ liệu cung cấp thông tin về các giao dịch mua sắm trên một nền tảng thương mại điện tử trong một khoảng thời gian một năm. Mỗi mục trong bộ dữ liệu mô tả việc mua sắm một sản phẩm bởi một khách hàng cụ thể và vào một ngày nhất định. Tổng cộng, có khoảng 4000 khách hàng xuất hiện trong cơ sở dữ liệu. Dựa trên thông tin có sẵn, nhóm em quyết định phát triển một bộ phân loại cho phép dự đoán loại mua sắm mà một khách hàng sẽ thực hiện, cũng như số lần ghé thăm mà khách hàng này sẽ thực hiện trong một năm. Giai đoạn đầu tiên của công việc này bao gồm việc mô tả các sản phẩm khác nhau được bán bởi trang web, nhóm các sản phẩm khác nhau thành 5 danh mục chính. Trong bước tiếp theo, nhóm thực hiện một phân loại về khách hàng bằng cách phân tích thói quen tiêu dùng của họ. Nhóm em đã phân loại khách hàng thành 11 danh mục chính dựa trên loại sản phẩm họ thường mua, số lần ghé thăm họ thực hiện và số tiền họ chi tiêu. Một khi các danh mục này được xác định, nhóm sẽ tiếp tục phân loại người tiêu dùng bằng các mô hình học máy như là Support Vector Machine Classifier (SVM), k-Nearest Neighbors, Decision Tree, Random Forest. Sau đó sẽ xem xét mô hình nào có kết quả tốt nhất. Ngoài ra còn có vẽ các loại biểu đồ để mô tả các thông tin quan trọng của bộ dữ liệu như là doanh thu theo ngày, tháng, năm và nhiều thông tin quan trọng khác.
+
+# 9. Tham khảo
+
+1.  CARRIE (2017). E-Commerce Data Actual transactions from UK retailer. Kaggle: Cộng đồng khoa học dữ liệu và học máy của bạn. Truy cập ngày 15 tháng 12 năm 2023: <https://www.kaggle.com/datasets/carrie1/ecommerce-data>
+
+2.  Abld All Awan (Tháng 6 năm 2023). K-Nearest Neighbors (KNN) Classification with R Tutorial. DataCamp. Truy cập ngày 15 tháng 12 năm 2023: <https://www.datacamp.com/tutorial/k-nearest-neighbors-knn-classification-with-r-tutorial>
+
+3.  Eugenia Anello (Tháng 3 năm 2023). K-Means Clustering in R Tutorial. DataCamp. Truy cập ngày 15 tháng 12 năm 2023: <https://www.datacamp.com/tutorial/k-means-clustering-r>
+
+4.  Yan Holtz. The R Graph Gallery. Truy cập ngày 10 tháng 12 năm 2023: <https://r-graph-gallery.com/index.html>
+
+5.  Arunn Thevapalan (Tháng 6 năm 2023). Decision Trees in Machine Learning Using R. Truy cập ngày 17 tháng 12 năm 2023: <https://www.datacamp.com/tutorial/decision-trees-R>
+
+6.  DỤC ĐOÀN TRÌNH (Tháng 1 năm 2022). Random Forest trong R, hướng dẫn sử dụng trong R. Websitehcm. Truy cập ngày 17 tháng 12 năm 2023: <https://websitehcm.com/random-forest-trong-r-huong-dan-su-dung-trong-r/>
+
+# 10. Đánh giá thành viên
+
+Đánh giá thành viên
+
+| Thành viên                      | Đóng góp                                                                                                                                                                                                                                                                                                                   | Mức độ hoàn thành | Ưu điểm                                                                                                     | Nhược điểm                                                                                                  |
+|---------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|-------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| Tăng Huỳnh Minh Tiến - 21133088 | Tìm kiếm tập dữ liệu, phân loại khách hàng (phân tích hành vi mua hàng), phân tích và dự đoán doanh thu (phân tích doanh thu hằng tháng, doanh số bán hàng diễn ra vào các ngày trong tuần, các thời điểm trong ngày, tổng doanh thu theo ngày trong tháng). Sử dụng model Support Vector Machine để phân loại khách hàng. | 100%              | Tích cực hoàn thành đúng thời gian và các nhiệm vụ được giao, có nhiều ý kiến đóng góp cho đề tài của nhóm. | Do thời gian hạn chế nên còn một số sai sót nhất định, Thiếu thời gian để nghiên cứu và tìm hiểu về đề tài. |
+| Nguyễn Hoàn Thảo - 21133081     | Tìm kiếm tập dữ liệu, khai phá dữ liệu, phân tích thông tin chi tiết về các danh mục sản phẩm (Những sản phẩm được mua nhiều nhất), Phân loại khách hàng, Định dạng dữ liệu, Nhóm các sản phẩm, Kết hợp đơn hàng của người tiêu dùng). Sử dụng model k-Nearest Neighbors để phân loại khách hàng.                          | 100%              | Tích cực hoàn thành đúng thời gian và các nhiệm vụ được giao, có nhiều ý kiến đóng góp cho đề tài của nhóm. | Do thời gian hạn chế nên còn một số sai sót nhất định, Thiếu thời gian để nghiên cứu và tìm hiểu về đề tài. |
+| Nguyễn Thành Trung - 21133090   | Tìm kiếm tập dữ liệu, khai pha dữ liệu, phân tích thông tin chi tiết về các danh mục sản phẩm (Mô tả sản phẩm - Description), Phân loại khách hàng (Tạo danh mục khách hàng, Mã hóa- định dạng dữ liệu, Điểm Silhoutte nội cụm, Hình thái khách hàng), Sử dụng model Decision Tree để phân loại khách hàng.                | 100%              | Tích cực hoàn thành đúng thời gian và các nhiệm vụ được giao, có nhiều ý kiến đóng góp cho đề tài của nhóm. | Do thời gian hạn chế nên còn một số sai sót nhất định, Thiếu thời gian để nghiên cứu và tìm hiểu về đề tài. |
+| Nguyễn Anh Tuấn - 21133113      | Tìm kiếm tập dữ liệu, khai pha dữ liệu, phân tích thông tin chi tiết về các danh mục sản phẩm (Xác định danh mục sản phẩm, mã hóa dữ liệu, phân cụm sản phẩm- cluster, Vẽ biểu đồ WordCould). Sử dụng model Random Forest để phân loại khách hàng.                                                                         | 100%              | Tích cực hoàn thành đúng thời gian và các nhiệm vụ được giao, có nhiều ý kiến đóng góp cho đề tài của nhóm. | Do thời gian hạn chế nên còn một số sai sót nhất định, Thiếu thời gian để nghiên cứu và tìm hiểu về đề tài. |
