@@ -2,6 +2,8 @@
 
 This repository contains code and data for customer segmentation analysis using R and Python. The analysis is based on an e-commerce dataset obtained from Kaggle.
 
+The analyses in this repository are based on the analysis by [FABIENDANIEL](https://www.kaggle.com/fabiendaniel) for reference purposes.
+
 ## Dataset
 
 The dataset used in this analysis is available on Kaggle: [E-Commerce Data](https://www.kaggle.com/datasets/carrie1/ecommerce-data). It contains information about customers, their orders, and product details.
