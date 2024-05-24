@@ -10,7 +10,7 @@ The dataset used in this analysis is available on Kaggle: [E-Commerce Data](http
 
 ### R
 
-The R code for customer segmentation analysis is provided in the `Customer-Segmentation-Analysis.Rmd` file.
+The R code for customer segmentation analysis is provided in the `Nhom-06_Bao-cao-cuoi-ky.Rmd` file.
 
 ### Python
 
