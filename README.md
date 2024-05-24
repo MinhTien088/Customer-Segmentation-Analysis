@@ -14,7 +14,7 @@ The R code for customer segmentation analysis is provided in the `Nhom-06_Bao-ca
 
 ### Python
 
-The Python code for customer segmentation analysis is provided in the `Customer-Segmentation-Analysis.ipynb` notebook.
+The Python code for customer segmentation analysis is provided in the `Project_CuoiKy_Nhom16.ipynb` notebook.
 
 ## Contributors
 
